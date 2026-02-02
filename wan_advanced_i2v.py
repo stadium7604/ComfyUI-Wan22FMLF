@@ -220,27 +220,33 @@ class WanAdvancedI2V(io.ComfyNode):
                 # Start with padding, then insert anchor, motion, middle, end at their positions
                 image_cond_latent = torch.zeros(1, latent_channels, total_latents, H, W, 
                                                dtype=anchor_latent.dtype, device=anchor_latent.device)
-                image_cond_latent = comfy.latent_formats.Wan21().process_out(image_cond_latent)
+                # Removed process_out on buffer, will process individual latents instead
                 
-                # Insert anchor at position 0 (if start frame enabled)
+                # Apply process_out to anchor_latent to match Wan2.1 expectation (Unscaled VAE space)
+                wan_format = comfy.latent_formats.Wan21()
                 if enable_start_frame:
+                    anchor_latent = wan_format.process_out(anchor_latent)
                     image_cond_latent[:, :, :1] = anchor_latent
                 
                 # Insert motion_latent right after anchor (for continuity)
                 motion_start = 1
                 motion_end = motion_start + motion_latent.shape[2]
                 if motion_end <= total_latents:
+                    # Reverted: motion_latent from KSampler seems to be already compatible or preferred as is.
+                    # Unscaling it caused color mismatch/discontinuity.
                     image_cond_latent[:, :, motion_start:motion_end] = motion_latent
                 
                 # Insert middle_image at middle_latent_idx if provided
                 if middle_image is not None and enable_middle_frame:
                     middle_latent = vae.encode(middle_image[:1, :, :, :3])
+                    middle_latent = wan_format.process_out(middle_latent) # Fix dimming
                     if middle_latent_idx < total_latents:
                         image_cond_latent[:, :, middle_latent_idx:middle_latent_idx+1] = middle_latent
                 
                 # Insert end_image at end_latent_idx if provided
                 if end_image is not None and enable_end_frame:
                     end_latent = vae.encode(end_image[:1, :, :, :3])
+                    end_latent = wan_format.process_out(end_latent) # Fix dimming
                     image_cond_latent[:, :, end_latent_idx:end_latent_idx+1] = end_latent
                 
                 # Create masks with strength parameters
@@ -270,13 +276,41 @@ class WanAdvancedI2V(io.ComfyNode):
                             safe_start = motion_end
                             fade_start = max(safe_start, middle_latent_idx - fade_latent_len)
                             
+                            
+                            # Identify start reference for interpolation
+                            interp_start = None
+                            interp_idx = 0
+                            if motion_latent_count > 0:
+                                interp_start = motion_latent[:, :, -1:].clone()
+                                # motion_latent is Scaled (KSampler). 
+                                # middle_latent is Unscaled (process_out).
+                                # We must unscale interp_start to match space for interpolation
+                                wan_format = comfy.latent_formats.Wan21()
+                                interp_start = wan_format.process_out(interp_start)
+                                interp_idx = motion_end
+                            elif enable_start_frame:
+                                interp_start = anchor_latent
+                                interp_idx = 0
+                                
                             if fade_start < middle_latent_idx:
                                 # Fill latents and ramp up mask strength
                                 for f in range(fade_start, middle_latent_idx):
-                                    image_cond_latent[:, :, f:f+1] = middle_latent
+                                    # Interpolate latent content if possible to avoid static image ghosting
+                                    if interp_start is not None:
+                                        # Calculate time-based ratio between start reference and middle
+                                        total_dist = middle_latent_idx - interp_idx
+                                        current_pos = f - interp_idx
+                                        ratio = current_pos / max(1, total_dist)
+                                        # Simple linear interpolation
+                                        image_cond_latent[:, :, f:f+1] = interp_start * (1.0 - ratio) + middle_latent * ratio
+                                    else:
+                                        # Fallback to copy
+                                        image_cond_latent[:, :, f:f+1] = middle_latent
                                     
-                                    # Linear ramp: close to middle = stronger (higher strength value, lower mask value)
-                                    progress = (f - fade_start + 1) / (middle_latent_idx - fade_start + 1)
+                                    # Non-linear ramp (Cubic): starts slower, ramps up at the end
+                                    # This prevents "early arrival" of the static frame
+                                    linear_progress = (f - fade_start + 1) / (middle_latent_idx - fade_start + 1)
+                                    progress = linear_progress ** 3.0
                                     
                                     h_str = high_noise_mid_strength * progress
                                     l_str = low_noise_mid_strength * progress
@@ -339,21 +373,25 @@ class WanAdvancedI2V(io.ComfyNode):
                 # Start with padding, then insert anchor, middle, end at their positions
                 image_cond_latent = torch.zeros(1, latent_channels, total_latents, H, W, 
                                                dtype=anchor_latent.dtype, device=anchor_latent.device)
-                image_cond_latent = comfy.latent_formats.Wan21().process_out(image_cond_latent)
                 
+                wan_format = comfy.latent_formats.Wan21()
+
                 # Insert anchor at position 0 (if start frame enabled)
                 if enable_start_frame:
+                    anchor_latent = wan_format.process_out(anchor_latent)
                     image_cond_latent[:, :, :1] = anchor_latent
                 
                 # Insert middle_image at middle_latent_idx if provided
                 if middle_image is not None and enable_middle_frame:
                     middle_latent = vae.encode(middle_image[:1, :, :, :3])
+                    middle_latent = wan_format.process_out(middle_latent) # Fix dimming
                     if middle_latent_idx < total_latents:
                         image_cond_latent[:, :, middle_latent_idx:middle_latent_idx+1] = middle_latent
                 
                 # Insert end_image at end_latent_idx if provided
                 if end_image is not None and enable_end_frame:
                     end_latent = vae.encode(end_image[:1, :, :, :3])
+                    end_latent = wan_format.process_out(end_latent) # Fix dimming
                     image_cond_latent[:, :, end_latent_idx:end_latent_idx+1] = end_latent
                 
                 # Create masks with strength parameters
@@ -383,13 +421,32 @@ class WanAdvancedI2V(io.ComfyNode):
                             safe_start = 1
                             fade_start = max(safe_start, middle_latent_idx - fade_latent_len)
                             
+                            
+                            # Identify start reference for interpolation
+                            interp_start = None
+                            interp_idx = 0
+                            if enable_start_frame:
+                                interp_start = anchor_latent
+                                interp_idx = 0
+                                
                             if fade_start < middle_latent_idx:
                                 # Fill latents and ramp up mask strength
                                 for f in range(fade_start, middle_latent_idx):
-                                    image_cond_latent[:, :, f:f+1] = middle_latent
+                                    # Interpolate latent content if possible
+                                    if interp_start is not None:
+                                        # Calculate time-based ratio between start reference and middle
+                                        total_dist = middle_latent_idx - interp_idx
+                                        current_pos = f - interp_idx
+                                        ratio = current_pos / max(1, total_dist)
+                                        # Simple linear interpolation
+                                        image_cond_latent[:, :, f:f+1] = interp_start * (1.0 - ratio) + middle_latent * ratio
+                                    else:
+                                        # Fallback to copy
+                                        image_cond_latent[:, :, f:f+1] = middle_latent
                                     
-                                    # Linear ramp: close to middle = stronger
-                                    progress = (f - fade_start + 1) / (middle_latent_idx - fade_start + 1)
+                                    # Non-linear ramp (Cubic): starts slower, ramps up at the end
+                                    linear_progress = (f - fade_start + 1) / (middle_latent_idx - fade_start + 1)
+                                    progress = linear_progress ** 3.0
                                     
                                     h_str = high_noise_mid_strength * progress
                                     l_str = low_noise_mid_strength * progress
