@@ -37,6 +37,7 @@ class WanAdvancedI2V(io.ComfyNode):
                 io.Image.Input("middle_image", optional=True),
                 io.Image.Input("end_image", optional=True),
                 io.Float.Input("middle_frame_ratio", default=0.5, min=0.0, max=1.0, step=0.01, round=0.01, display_mode=io.NumberDisplay.slider, optional=True),
+                io.Int.Input("middle_frame_fade_in", default=0, min=0, max=200, step=1, display_mode=io.NumberDisplay.number, optional=True, tooltip="Number of frames before the middle frame to start fading in the guidance."),
                 io.Image.Input("motion_frames", optional=True),
                 io.Int.Input("video_frame_offset", default=0, min=0, max=1000000, step=1, display_mode=io.NumberDisplay.number, optional=True),
                 io.Combo.Input("long_video_mode", ["DISABLED", "AUTO_CONTINUE", "SVI", "LATENT_CONTINUE"], default="DISABLED", optional=True),
@@ -70,7 +71,7 @@ class WanAdvancedI2V(io.ComfyNode):
     @classmethod
     def execute(cls, positive, negative, vae, width, height, length, batch_size,
                 mode="NORMAL", start_image=None, middle_image=None, end_image=None,
-                middle_frame_ratio=0.5, motion_frames=None, video_frame_offset=0,
+                middle_frame_ratio=0.5, middle_frame_fade_in=0, motion_frames=None, video_frame_offset=0,
                 long_video_mode="DISABLED", continue_frames_count=5,
                 high_noise_start_strength=1.0, high_noise_mid_strength=0.8, 
                 low_noise_start_strength=1.0, low_noise_mid_strength=0.2, low_noise_end_strength=1.0,
@@ -260,6 +261,30 @@ class WanAdvancedI2V(io.ComfyNode):
                     end_range = min(total_latents, middle_latent_idx + 1)
                     mask_svi_high[:, :, start_range:end_range] = max(0.0, 1.0 - high_noise_mid_strength)
                     mask_svi_low[:, :, start_range:end_range] = max(0.0, 1.0 - low_noise_mid_strength)
+
+                    # Fade-in logic
+                    if middle_frame_fade_in > 0:
+                        fade_latent_len = middle_frame_fade_in // 4
+                        if fade_latent_len > 0:
+                            # Determine safe start index (after motion)
+                            safe_start = motion_end
+                            fade_start = max(safe_start, middle_latent_idx - fade_latent_len)
+                            
+                            if fade_start < middle_latent_idx:
+                                # Fill latents and ramp up mask strength
+                                for f in range(fade_start, middle_latent_idx):
+                                    image_cond_latent[:, :, f:f+1] = middle_latent
+                                    
+                                    # Linear ramp: close to middle = stronger (higher strength value, lower mask value)
+                                    progress = (f - fade_start + 1) / (middle_latent_idx - fade_start + 1)
+                                    
+                                    h_str = high_noise_mid_strength * progress
+                                    l_str = low_noise_mid_strength * progress
+                                    
+                                    mask_svi_high[:, :, f] = max(0.0, 1.0 - h_str)
+                                    mask_svi_low[:, :, f] = max(0.0, 1.0 - l_str)
+
+
                 
                 # End frame: apply strength (only if enabled)
                 if end_image is not None and enable_end_frame:
@@ -349,6 +374,28 @@ class WanAdvancedI2V(io.ComfyNode):
                     end_range = min(total_latents, middle_latent_idx + 1)
                     mask_svi_high[:, :, start_range:end_range] = max(0.0, 1.0 - high_noise_mid_strength)
                     mask_svi_low[:, :, start_range:end_range] = max(0.0, 1.0 - low_noise_mid_strength)
+
+                    # Fade-in logic
+                    if middle_frame_fade_in > 0:
+                        fade_latent_len = middle_frame_fade_in // 4
+                        if fade_latent_len > 0:
+                            # Determine safe start index (after start frame at 0, so 1)
+                            safe_start = 1
+                            fade_start = max(safe_start, middle_latent_idx - fade_latent_len)
+                            
+                            if fade_start < middle_latent_idx:
+                                # Fill latents and ramp up mask strength
+                                for f in range(fade_start, middle_latent_idx):
+                                    image_cond_latent[:, :, f:f+1] = middle_latent
+                                    
+                                    # Linear ramp: close to middle = stronger
+                                    progress = (f - fade_start + 1) / (middle_latent_idx - fade_start + 1)
+                                    
+                                    h_str = high_noise_mid_strength * progress
+                                    l_str = low_noise_mid_strength * progress
+                                    
+                                    mask_svi_high[:, :, f] = max(0.0, 1.0 - h_str)
+                                    mask_svi_low[:, :, f] = max(0.0, 1.0 - l_str)
                 
                 # End frame: apply strength (only if enabled)
                 if end_image is not None and enable_end_frame:
